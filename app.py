@@ -42,15 +42,23 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────
-#  CAMERA INTRINSICS  (hardcoded from DJI XMP — Module 1)
+#  CAMERA INTRINSICS
+#  These are NOT hardcoded anymore — they are derived per-dataset
+#  in the Step 1 pipeline below (see `resolve_camera_intrinsics`),
+#  with a fallback chain: DJI XMP > EXIF 35mm-equivalent > manual
+#  sidebar input. The globals below are just placeholders until
+#  a dataset is loaded and the pipeline runs.
 # ─────────────────────────────────────────────────────────────
-SCALE       = 0.25
-fx          = 3725.151611 * SCALE
-fy          = 3725.151611 * SCALE
-cx          = 2640.0      * SCALE
-cy          = 1978.0      * SCALE
-K           = np.array([[fx,0,cx],[0,fy,cy],[0,0,1]], dtype=np.float64)
-dist_coeffs = np.array([-0.112575240, 0.014874430, -0.027064110, 0.0, -0.000085720])
+SCALE       = 0.25   # working-resolution scale factor (not camera-specific)
+fx = fy = cx = cy = None
+K           = None
+dist_coeffs = np.zeros(5)  # default: no distortion correction unless DJI DewarpData is found
+
+# Known DJI Mavic 3 Enterprise DewarpData distortion coefficients (k1,k2,p1,p2,k3).
+# Used only when a dataset is confirmed to be from this exact camera (via XMP
+# CalibratedFocalLength). Other datasets get zero distortion by default since
+# we have no way to derive real lens distortion without a calibration step.
+DJI_DEWARP_DIST = np.array([-0.112575240, 0.014874430, -0.027064110, 0.0, -0.000085720])
 
 MIN_RELIABLE_INLIERS = 25
 
@@ -86,23 +94,74 @@ def parse_xmp(raw):
             except: result[f] = match.group(1)
     return result
 
-def extract_metadata(p):
+def _to_float(v):
+    """EXIF values sometimes come back as PIL.TiffImagePlugin.IFDRational — normalize to float."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+def extract_metadata(p, frame_index=0):
+    """
+    Extract everything we can from an image: DJI XMP if present, otherwise
+    falls back to standard EXIF. Nothing here raises — if a field can't be
+    found, it's simply left out of the record and handled later with a
+    fallback / manual override / clear warning, rather than crashing or
+    silently using a DJI-only constant.
+    """
     rec = {'filepath': p, 'filename': os.path.basename(p)}
-    m   = re.search(r'DJI_(\d{8})(\d{6})_(\d+)_V', p)
+
+    # ── Frame ID + timestamp: try DJI filename convention first ────────────
+    m = re.search(r'DJI_(\d{8})(\d{6})_(\d+)_V', p)
     if m:
-        rec['frame_id']  = int(m.group(3))
-        rec['timestamp'] = datetime.strptime(m.group(1) + m.group(2), '%Y%m%d%H%M%S')
+        rec['frame_id']       = int(m.group(3))
+        rec['timestamp']      = datetime.strptime(m.group(1) + m.group(2), '%Y%m%d%H%M%S')
+        rec['timestamp_src']  = 'dji_filename'
+
     img      = PILImage.open(p)
+    img_w, img_h = img.size
+    rec['img_width']  = img_w
+    rec['img_height'] = img_h
+
     exif_raw = img._getexif()
     if exif_raw:
         exif = {TAGS.get(k, k): v for k, v in exif_raw.items()}
         gps  = exif.get('GPSInfo', {})
         if gps:
-            rec['exif_lat'] = parse_gps_coord(gps[2], gps[1])
-            rec['exif_lon'] = parse_gps_coord(gps[4], gps[3])
+            try:
+                rec['exif_lat'] = parse_gps_coord(gps[2], gps[1])
+                rec['exif_lon'] = parse_gps_coord(gps[4], gps[3])
+            except Exception:
+                pass
+            if 6 in gps:  # GPS altitude (meters, ASL) — standard EXIF tag, not DJI-specific
+                rec['exif_gps_alt'] = _to_float(gps[6])
+
+        rec['exif_focal_mm']   = _to_float(exif.get('FocalLength'))
+        rec['exif_focal_35mm'] = _to_float(exif.get('FocalLengthIn35mmFilm'))
+
+        # Fallback timestamp if DJI filename pattern didn't match
+        if 'timestamp' not in rec:
+            dt_raw = exif.get('DateTimeOriginal') or exif.get('DateTime')
+            if dt_raw:
+                try:
+                    rec['timestamp']     = datetime.strptime(dt_raw, '%Y:%m:%d %H:%M:%S')
+                    rec['timestamp_src'] = 'exif_datetime'
+                except ValueError:
+                    pass
+
+    # Last-resort fallback: no DJI filename, no EXIF datetime — synthesize
+    # an evenly-spaced timestamp from frame order so the pipeline can still
+    # run (flagged later as an estimate, not real timing).
+    if 'timestamp' not in rec:
+        rec['timestamp']     = datetime(2000, 1, 1) + pd.Timedelta(seconds=frame_index)
+        rec['timestamp_src'] = 'synthetic_sequential'
+
+    if 'frame_id' not in rec:
+        rec['frame_id'] = frame_index
+
     with open(p, 'rb') as f:
         raw = f.read()
-    rec.update(parse_xmp(raw))
+    rec.update(parse_xmp(raw))  # no-ops harmlessly if there's no DJI XMP block
     return rec
 
 def load_undistort(p):
@@ -141,6 +200,68 @@ def track_pair(p1, p2, orb):
         'reliable' : len(ip1) >= MIN_RELIABLE_INLIERS
     }
 
+def resolve_camera_intrinsics(df, img_w, img_h, manual_focal_px=0.0):
+    """
+    Fallback chain for camera intrinsics, in order of accuracy:
+      1. Manual override from sidebar (if the user typed a value in)
+      2. DJI XMP CalibratedFocalLength / CalibratedOpticalCenter (exact, dataset-specific)
+      3. EXIF FocalLengthIn35mmFilm -> pixel estimate via the 35mm-equivalent
+         sensor-width approximation (approximate, works for most cameras/phones)
+      4. Nothing usable found -- caller must ask the user for a value.
+    Returns (fx_full, fy_full, cx_full, cy_full, dist_coeffs_full, source_label, ok)
+    ok=False means no usable focal length was found at all.
+    """
+    first = df.iloc[0]
+
+    if manual_focal_px and manual_focal_px > 0:
+        fx_full = fy_full = float(manual_focal_px)
+        cx_full, cy_full = img_w / 2.0, img_h / 2.0
+        return fx_full, fy_full, cx_full, cy_full, np.zeros(5), "manual override", True
+
+    if pd.notna(first.get('CalibratedFocalLength')):
+        fx_full = fy_full = float(first['CalibratedFocalLength'])
+        cx_full = float(first.get('CalibratedOpticalCenterX', img_w / 2.0))
+        cy_full = float(first.get('CalibratedOpticalCenterY', img_h / 2.0))
+        return fx_full, fy_full, cx_full, cy_full, DJI_DEWARP_DIST, "DJI calibrated (XMP)", True
+
+    if pd.notna(first.get('exif_focal_35mm')) and first.get('exif_focal_35mm', 0) > 0:
+        fx_full = fy_full = (img_w * float(first['exif_focal_35mm'])) / 36.0
+        cx_full, cy_full = img_w / 2.0, img_h / 2.0
+        return fx_full, fy_full, cx_full, cy_full, np.zeros(5), "estimated from EXIF 35mm-equivalent focal length", True
+
+    return None, None, img_w / 2.0, img_h / 2.0, np.zeros(5), "none found", False
+
+
+def resolve_altitude_m(row, manual_altitude_m=0.0):
+    """Height-above-ground fallback chain for the pixel-to-meters conversion."""
+    if pd.notna(row.get('RelativeAltitude')):
+        return float(row['RelativeAltitude']), 'dji_relative_altitude'
+    if manual_altitude_m and manual_altitude_m > 0:
+        return float(manual_altitude_m), 'manual_override'
+    if pd.notna(row.get('exif_gps_alt')):
+        return float(row['exif_gps_alt']), 'exif_gps_altitude_asl'
+    return None, 'unavailable'
+
+
+def resolve_yaw_deg(row, fallback_bearing=0.0, manual_yaw_deg=0.0):
+    """Heading fallback chain used to rotate pixel displacement into geographic NED."""
+    if pd.notna(row.get('FlightYawDegree')):
+        return float(row['FlightYawDegree']), 'dji_flight_yaw'
+    if manual_yaw_deg:
+        return float(manual_yaw_deg), 'manual_override'
+    return float(fallback_bearing), 'estimated_from_gps_track'
+
+
+def gps_track_bearing(lat1, lon1, lat2, lon2):
+    """Compass bearing between two GPS points -- last-resort heading estimate
+    when no flight-yaw telemetry is available."""
+    lat1r, lat2r = np.radians(lat1), np.radians(lat2)
+    dlon = np.radians(lon2 - lon1)
+    x = np.sin(dlon) * np.cos(lat2r)
+    y = np.cos(lat1r) * np.sin(lat2r) - np.sin(lat1r) * np.cos(lat2r) * np.cos(dlon)
+    return (np.degrees(np.arctan2(x, y)) + 360) % 360
+
+
 def pixels_to_ned(dx_px, dy_px, altitude_m, yaw_deg):
     dX  = (dx_px / fx) * altitude_m
     dY  = (dy_px / fy) * altitude_m
@@ -149,33 +270,70 @@ def pixels_to_ned(dx_px, dy_px, altitude_m, yaw_deg):
     dE  = -(-np.sin(yr) * dX + np.cos(yr) * dY)
     return dN, dE
 
-def build_displacements(tracking_results, df):
-    displacements = []
-    sources       = []
+def build_displacements(tracking_results, df, manual_altitude_m=0.0, manual_yaw_deg=0.0):
+    """
+    Returns (displacements, sources, fallback_notes). fallback_notes records,
+    per-pair, which altitude/yaw source was actually used, so the UI can warn
+    the user when estimates rather than real telemetry drove the numbers
+    (instead of silently reusing DJI-only values on other datasets).
+    """
+    displacements  = []
+    sources        = []
+    fallback_notes = []
+    has_imu_speed  = 'FlightXSpeed' in df.columns and 'FlightYSpeed' in df.columns
+
     for i, r in enumerate(tracking_results):
-        row    = df.iloc[i]
-        dt     = float(df.iloc[i + 1]['time_s'] - row['time_s'])
-        imu_dn = float(row['FlightXSpeed']) * dt
-        imu_de = float(row['FlightYSpeed']) * dt
+        row = df.iloc[i]
+        dt  = float(df.iloc[i + 1]['time_s'] - row['time_s'])
+
+        if has_imu_speed and pd.notna(row.get('FlightXSpeed')) and pd.notna(row.get('FlightYSpeed')):
+            imu_dn = float(row['FlightXSpeed']) * dt
+            imu_de = float(row['FlightYSpeed']) * dt
+        else:
+            # No IMU/flight-speed telemetry in this dataset -- can't estimate
+            # motion for frames where vision tracking also failed. Assume
+            # zero motion rather than crashing; this is flagged to the user.
+            imu_dn = imu_de = 0.0
+
         if r is None:
             dn, de  = imu_dn, imu_de
             src_tag = 'imu_only'
+            fallback_notes.append('no_telemetry_zero_motion' if not has_imu_speed else 'ok')
         else:
-            vo_dn, vo_de = pixels_to_ned(
-                r['dx'], r['dy'],
-                float(row['RelativeAltitude']),
-                float(row['FlightYawDegree'])
-            )
-            if r.get('reliable', True):
-                dn, de  = vo_dn, vo_de
-                src_tag = 'vision'
+            altitude_m, alt_src = resolve_altitude_m(row, manual_altitude_m)
+            if altitude_m is None:
+                # No altitude available from any source -- vision displacement
+                # can't be scaled to meters. Fall back to IMU (or zero) for
+                # this pair rather than raising an exception.
+                dn, de  = imu_dn, imu_de
+                src_tag = 'imu_only'
+                fallback_notes.append('no_altitude_available')
             else:
-                dn      = 0.5 * vo_dn + 0.5 * imu_dn
-                de      = 0.5 * vo_de + 0.5 * imu_de
-                src_tag = 'blended'
+                bearing = 0.0
+                if 'GpsLatitude' in df.columns and i + 1 < len(df):
+                    if pd.notna(row.get('GpsLatitude')) and pd.notna(df.iloc[i+1].get('GpsLatitude')):
+                        bearing = gps_track_bearing(
+                            row['GpsLatitude'], row['GpsLongitude'],
+                            df.iloc[i+1]['GpsLatitude'], df.iloc[i+1]['GpsLongitude']
+                        )
+                yaw_deg, yaw_src = resolve_yaw_deg(row, bearing, manual_yaw_deg)
+                vo_dn, vo_de = pixels_to_ned(r['dx'], r['dy'], altitude_m, yaw_deg)
+
+                if alt_src != 'dji_relative_altitude' or yaw_src != 'dji_flight_yaw':
+                    fallback_notes.append(f'alt={alt_src},yaw={yaw_src}')
+                else:
+                    fallback_notes.append('ok')
+
+                if r.get('reliable', True):
+                    dn, de  = vo_dn, vo_de
+                    src_tag = 'vision'
+                else:
+                    dn      = 0.5 * vo_dn + 0.5 * imu_dn
+                    de      = 0.5 * vo_de + 0.5 * imu_de
+                    src_tag = 'blended'
         displacements.append((dn, de))
         sources.append(src_tag)
-    return displacements, sources
+    return displacements, sources, fallback_notes
 
 def gps_aided_vio(displacements, gps_mask, real_north, real_east):
     n     = len(gps_mask)
@@ -266,37 +424,65 @@ with st.sidebar:
     dataset_dir  = None
     image_paths  = []
 
+    IMG_EXTS = ('jpg', 'jpeg', 'JPG', 'JPEG', 'png', 'PNG')
+
+    def _find_images(root):
+        found = []
+        for ext in IMG_EXTS:
+            found += glob.glob(f"{root}/**/*.{ext}", recursive=True)
+        return sorted(set(found))
+
     if upload_mode == "Upload ZIP":
         uploaded = st.file_uploader(
             "Upload dataset ZIP",
             type=["zip"],
-            help="ZIP file containing DJI_*.JPG images"
+            help="ZIP file of images -- DJI JPEGs work best, but any JPG/PNG sequence is accepted"
         )
         if uploaded:
             tmp_dir = tempfile.mkdtemp()
             with zipfile.ZipFile(uploaded) as zf:
                 zf.extractall(tmp_dir)
-            image_paths = sorted(glob.glob(f"{tmp_dir}/**/*.JPG", recursive=True))
-            if not image_paths:
-                image_paths = sorted(glob.glob(f"{tmp_dir}/**/*.jpg", recursive=True))
+            image_paths = _find_images(tmp_dir)
             if image_paths:
                 dataset_dir = os.path.dirname(image_paths[0])
                 st.success(f"Found {len(image_paths)} images")
+            else:
+                st.warning("No JPG/PNG images found in that ZIP")
     else:
         folder = st.text_input(
             "Folder path",
             value="4thAve1",
-            help="Path to folder containing DJI_*.JPG files"
+            help="Path to a folder of images (DJI JPEGs work best, but any JPG/PNG sequence is accepted)"
         )
         if os.path.exists(folder):
-            image_paths = sorted(glob.glob(f"{folder}/DJI_*.JPG"))
+            image_paths = _find_images(folder)
             if image_paths:
                 dataset_dir = folder
                 st.success(f"Found {len(image_paths)} images")
             else:
-                st.warning("No DJI_*.JPG files found in that folder")
+                st.warning("No JPG/PNG images found in that folder")
         else:
             st.info("Enter a valid folder path")
+
+    st.divider()
+    st.subheader("📷 Camera & flight overrides")
+    st.caption(
+        "Only needed for non-DJI datasets that lack calibrated metadata. "
+        "Leave at 0 to auto-detect from EXIF/XMP -- the pipeline will tell "
+        "you what it used after running."
+    )
+    manual_focal_px = st.number_input(
+        "Focal length override (px, full-res)", min_value=0.0, value=0.0, step=1.0,
+        help="Only used if the dataset has no DJI CalibratedFocalLength and no EXIF 35mm-equivalent focal length"
+    )
+    manual_altitude_m = st.number_input(
+        "Assumed altitude AGL override (m)", min_value=0.0, value=0.0, step=1.0,
+        help="Only used for frames missing DJI RelativeAltitude and EXIF GPS altitude"
+    )
+    manual_yaw_deg = st.number_input(
+        "Assumed constant heading override (deg from North)", value=0.0, step=1.0,
+        help="Only used for frames missing DJI FlightYawDegree; otherwise heading is estimated from the GPS track"
+    )
 
     st.divider()
     st.subheader("⚙️ GPS Dropout Settings")
@@ -318,7 +504,7 @@ with st.sidebar:
 #  MAIN AREA
 # ─────────────────────────────────────────────────────────────
 st.title("Visual Inertial Odometry Pipeline")
-st.caption("DJI Mavic 3 Enterprise · GPS-aided VIO with drift correction")
+st.caption("Works with DJI drone footage or any geotagged JPG/PNG sequence · GPS-aided VIO with drift correction")
 
 if not image_paths:
     st.info("👈  Upload a dataset or enter a folder path in the sidebar to get started.")
@@ -335,18 +521,147 @@ if run_btn:
     prog1 = st.progress(0, text="Reading EXIF & XMP...")
     records = []
     for idx, p in enumerate(image_paths):
-        records.append(extract_metadata(p))
+        records.append(extract_metadata(p, frame_index=idx))
         prog1.progress((idx + 1) / len(image_paths),
                        text=f"Frame {idx+1} / {len(image_paths)}")
 
-    df          = pd.DataFrame(records).sort_values('frame_id').reset_index(drop=True)
-    df['time_s']   = (df['timestamp'] - df['timestamp'].iloc[0]).dt.total_seconds()
-    df['speed_ms'] = np.sqrt(
-        df['FlightXSpeed']**2 + df['FlightYSpeed']**2 + df['FlightZSpeed']**2
-    )
+    df = pd.DataFrame(records).sort_values('frame_id').reset_index(drop=True)
+    df['time_s'] = (df['timestamp'] - df['timestamp'].iloc[0]).dt.total_seconds()
+
+    if 'FlightXSpeed' in df.columns:
+        df['speed_ms'] = np.sqrt(
+            df['FlightXSpeed'].fillna(0)**2 + df['FlightYSpeed'].fillna(0)**2
+            + df.get('FlightZSpeed', pd.Series(0, index=df.index)).fillna(0)**2
+        )
+    else:
+        df['speed_ms'] = np.nan  # no flight-speed telemetry in this dataset
     prog1.empty()
+
+    # Normalize GPS/altitude columns: DJI datasets get GpsLatitude/GpsLongitude/
+    # AbsoluteAltitude from XMP; non-DJI datasets only have the standard EXIF
+    # exif_lat/exif_lon/exif_gps_alt fields. Use whichever is available so the
+    # rest of the pipeline can rely on one consistent set of column names.
+    if 'GpsLatitude' not in df.columns:
+        df['GpsLatitude'] = np.nan
+    if 'GpsLongitude' not in df.columns:
+        df['GpsLongitude'] = np.nan
+    if 'exif_lat' in df.columns:
+        df['GpsLatitude'] = df['GpsLatitude'].fillna(df['exif_lat'])
+    if 'exif_lon' in df.columns:
+        df['GpsLongitude'] = df['GpsLongitude'].fillna(df['exif_lon'])
+
+    if 'AbsoluteAltitude' not in df.columns:
+        df['AbsoluteAltitude'] = np.nan
+    if 'exif_gps_alt' in df.columns:
+        df['AbsoluteAltitude'] = df['AbsoluteAltitude'].fillna(df['exif_gps_alt'])
+    # Last resort so ned2geodetic doesn't crash -- this only affects the
+    # vertical/altitude value in exports, not the horizontal error metrics
+    # this dashboard is built around.
+    df['AbsoluteAltitude'] = df['AbsoluteAltitude'].fillna(0.0)
+
+    # GPS is required: the whole point of this dashboard is comparing VIO
+    # estimates against real GPS during simulated dropout, so there's no
+    # meaningful way to proceed without per-frame GPS coordinates. Fail
+    # clearly here instead of crashing deep inside the math later.
+    has_gps = 'GpsLatitude' in df.columns and 'GpsLongitude' in df.columns \
+              and df['GpsLatitude'].notna().all() and df['GpsLongitude'].notna().all()
+    if not has_gps:
+        st.error(
+            "This dataset doesn't have per-frame GPS coordinates in its "
+            "metadata (EXIF GPS tags or DJI XMP GpsLatitude/GpsLongitude). "
+            "This dashboard needs real GPS on every frame as ground truth to "
+            "measure VIO drift against -- without it there's nothing to "
+            "compare the vision-based estimate to. Try a dataset with "
+            "geotagged images (most drone footage and many phone photos "
+            "qualify)."
+        )
+        st.stop()
+
+    # Resolve RelativeAltitude/FlightYawDegree into normalized columns so
+    # every downstream reference (metrics row, CSV export, etc.) can rely on
+    # these columns always existing, instead of KeyError-ing on datasets
+    # that never had DJI telemetry in the first place. Each row keeps
+    # whatever real value it had; only missing rows get backfilled.
+    had_dji_altitude = 'RelativeAltitude' in df.columns and df['RelativeAltitude'].notna().all()
+    had_dji_yaw      = 'FlightYawDegree' in df.columns and df['FlightYawDegree'].notna().all()
+
+    if 'RelativeAltitude' not in df.columns:
+        df['RelativeAltitude'] = np.nan
+    resolved_alt = []
+    for _, row in df.iterrows():
+        val, _src = resolve_altitude_m(row, manual_altitude_m)
+        resolved_alt.append(val if val is not None else np.nan)
+    df['RelativeAltitude'] = resolved_alt
+
+    if 'FlightYawDegree' not in df.columns:
+        df['FlightYawDegree'] = np.nan
+    resolved_yaw = []
+    for i, row in df.iterrows():
+        if pd.notna(row.get('FlightYawDegree')):
+            resolved_yaw.append(float(row['FlightYawDegree']))
+        elif manual_yaw_deg:
+            resolved_yaw.append(float(manual_yaw_deg))
+        elif i + 1 < len(df) and pd.notna(df.iloc[i + 1].get('GpsLatitude')):
+            resolved_yaw.append(gps_track_bearing(
+                row['GpsLatitude'], row['GpsLongitude'],
+                df.iloc[i + 1]['GpsLatitude'], df.iloc[i + 1]['GpsLongitude']
+            ))
+        else:
+            resolved_yaw.append(0.0)
+    df['FlightYawDegree'] = resolved_yaw
+
+    # Camera intrinsics: fallback chain (manual override > DJI XMP > EXIF 35mm)
+    img0 = PILImage.open(image_paths[0])
+    img_w, img_h = img0.size
+    fx_full, fy_full, cx_full, cy_full, dist_coeffs_full, focal_src, focal_ok = \
+        resolve_camera_intrinsics(df, img_w, img_h, manual_focal_px)
+
+    if not focal_ok:
+        st.error(
+            "Couldn't determine focal length from this dataset's metadata "
+            "(no DJI calibration, no EXIF 35mm-equivalent focal length), and "
+            "no manual override was provided. Enter a value in the sidebar "
+            "under 'Camera & flight overrides' -> 'Focal length override "
+            "(px, full-res)' and run the pipeline again. As a rough starting "
+            f"point, the image width is {img_w}px -- for a typical smartphone "
+            "or drone camera, focal length in pixels is often close to the "
+            "image width, but this varies by lens."
+        )
+        st.stop()
+
+    fx, fy = fx_full * SCALE, fy_full * SCALE
+    cx, cy = cx_full * SCALE, cy_full * SCALE
+    K           = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+    dist_coeffs = dist_coeffs_full
+
     st.success(f"✓ Metadata extracted — {len(df)} frames, "
                f"{df['time_s'].iloc[-1]:.0f}s flight")
+
+    fallback_msgs = []
+    if focal_src != "DJI calibrated (XMP)":
+        fallback_msgs.append(f"📷 Camera focal length: **{focal_src}** ({fx_full:.1f}px full-res) "
+                              f"— not DJI-calibrated, so results will be approximate.")
+    if 'timestamp_src' in df.columns and (df['timestamp_src'] == 'synthetic_sequential').any():
+        fallback_msgs.append("🕐 Some frame timestamps were synthesized (1s apart) because no "
+                              "DJI filename pattern or EXIF DateTimeOriginal was found — "
+                              "speed/timing-dependent numbers are approximate.")
+    if not had_dji_altitude:
+        fallback_msgs.append("📏 No DJI relative-altitude telemetry found for some/all frames — "
+                              "falling back to EXIF GPS altitude or your manual override where needed.")
+    if not had_dji_yaw:
+        fallback_msgs.append("🧭 No DJI flight-yaw telemetry found for some/all frames — "
+                              "heading is being estimated from consecutive GPS points or your manual override instead.")
+    if df['RelativeAltitude'].isna().any():
+        fallback_msgs.append("❗ Some frames have no altitude from any source (no DJI telemetry, "
+                              "no EXIF GPS altitude, no manual override) — those frame pairs will "
+                              "fall back to IMU/zero motion instead of vision-based displacement.")
+    if 'FlightXSpeed' not in df.columns:
+        fallback_msgs.append("🚀 No IMU flight-speed telemetry found — frames where vision "
+                              "tracking fails will assume zero motion instead of an IMU estimate.")
+    if fallback_msgs:
+        with st.expander("⚠️ This dataset is missing some DJI-specific metadata — click for details", expanded=True):
+            for msg in fallback_msgs:
+                st.warning(msg)
 
     # ── Step 2: Feature tracking ────────────────────────────
     st.subheader("Step 2 / 4 — Feature tracking")
@@ -375,9 +690,19 @@ if run_btn:
 
     # ── Step 3: Displacements ───────────────────────────────
     st.subheader("Step 3 / 4 — Converting to real-world displacements")
-    displacements, sources = build_displacements(tracking, df)
+    displacements, sources, disp_fallback_notes = build_displacements(
+        tracking, df, manual_altitude_m=manual_altitude_m, manual_yaw_deg=manual_yaw_deg
+    )
     src_counts = {s: sources.count(s) for s in set(sources)}
     st.success(f"✓ Displacements built — {src_counts}")
+
+    n_estimated_pairs = sum(1 for n in disp_fallback_notes if n != 'ok')
+    if n_estimated_pairs:
+        st.caption(
+            f"ℹ️ {n_estimated_pairs}/{len(disp_fallback_notes)} frame pairs used an "
+            f"estimated (non-DJI) altitude and/or heading value -- see the metadata "
+            f"warning above for details."
+        )
 
     # ── Step 4: VIO estimation ──────────────────────────────
     st.subheader("Step 4 / 4 — Running VIO estimator")
@@ -435,8 +760,10 @@ if run_btn:
     c1.metric("Frames",        f"{n_frames}")
     c2.metric("Distance",      f"{total_dist:.0f} m")
     c3.metric("Duration",      f"{df['time_s'].iloc[-1]:.0f} s")
-    c4.metric("Mean altitude", f"{df['RelativeAltitude'].mean():.1f} m")
-    c5.metric("Avg speed",     f"{df['speed_ms'].mean():.1f} m/s")
+    mean_alt   = df['RelativeAltitude'].mean()
+    mean_speed = df['speed_ms'].mean()
+    c4.metric("Mean altitude", f"{mean_alt:.1f} m" if pd.notna(mean_alt) else "N/A")
+    c5.metric("Avg speed",     f"{mean_speed:.1f} m/s" if pd.notna(mean_speed) else "N/A")
 
     st.divider()
 
