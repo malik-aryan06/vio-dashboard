@@ -85,7 +85,8 @@ def parse_xmp(raw):
     fields = ['AbsoluteAltitude', 'RelativeAltitude', 'GimbalPitchDegree',
               'FlightRollDegree', 'FlightYawDegree', 'FlightPitchDegree',
               'FlightXSpeed', 'FlightYSpeed', 'FlightZSpeed',
-              'GpsLatitude', 'GpsLongitude']
+              'GpsLatitude', 'GpsLongitude',
+              'CalibratedFocalLength', 'CalibratedOpticalCenterX', 'CalibratedOpticalCenterY']
     result = {}
     for f in fields:
         match = re.search(rf'drone-dji:{f}="([^"]+)"', xmp)
@@ -415,10 +416,15 @@ with st.sidebar:
     st.divider()
 
     st.subheader("📁 Dataset")
+
+    SAMPLE_ZIP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_data", "sample_dataset.zip")
+    has_sample = os.path.exists(SAMPLE_ZIP_PATH)
+
+    input_options = (["✨ Try sample dataset"] if has_sample else []) + ["Upload ZIP", "Local folder path"]
     upload_mode = st.radio(
         "Input source",
-        ["Upload ZIP", "Local folder path"],
-        help="Upload a .zip of DJI JPEGs, or point to a local folder"
+        input_options,
+        help="Try the bundled sample instantly, upload your own .zip of images, or point to a local folder"
     )
 
     dataset_dir  = None
@@ -432,7 +438,22 @@ with st.sidebar:
             found += glob.glob(f"{root}/**/*.{ext}", recursive=True)
         return sorted(set(found))
 
-    if upload_mode == "Upload ZIP":
+    if upload_mode == "✨ Try sample dataset":
+        # Bundled with the repo -- extracted once per session and cached so
+        # repeat clicks don't re-extract the zip every time.
+        if 'sample_extracted_dir' not in st.session_state:
+            tmp_dir = tempfile.mkdtemp()
+            with zipfile.ZipFile(SAMPLE_ZIP_PATH) as zf:
+                zf.extractall(tmp_dir)
+            st.session_state['sample_extracted_dir'] = tmp_dir
+        image_paths = _find_images(st.session_state['sample_extracted_dir'])
+        if image_paths:
+            dataset_dir = os.path.dirname(image_paths[0])
+            st.success(f"Loaded bundled sample — {len(image_paths)} images, ready to run")
+        else:
+            st.error("Bundled sample_dataset.zip was found but contained no JPG/PNG images")
+
+    elif upload_mode == "Upload ZIP":
         uploaded = st.file_uploader(
             "Upload dataset ZIP",
             type=["zip"],
