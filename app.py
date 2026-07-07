@@ -508,10 +508,32 @@ with st.sidebar:
     st.divider()
     st.subheader("⚙️ GPS Dropout Settings")
 
-    dropout_b_start = st.slider("Scenario B — dropout start frame", 0, 40, 20)
-    dropout_b_end   = st.slider("Scenario B — dropout end frame",   1, 50, 25)
-    dropout_c_start = st.slider("Scenario C — dropout start frame", 0, 40, 15)
-    dropout_c_end   = st.slider("Scenario C — dropout end frame",   1, 52, 30)
+    # Scale dropout windows to whatever dataset is actually loaded, instead of
+    # hardcoded frame numbers that assume a 53-frame dataset. Without this, a
+    # smaller sample (e.g. the bundled 10-frame demo) would have every
+    # "dropout" window fall outside the available frames entirely, silently
+    # making every GPS-aided scenario identical to "Full GPS" (0.00 error).
+    n_loaded  = len(image_paths) if image_paths else 53
+    max_frame = max(n_loaded - 2, 1)  # leave at least 1 frame pair after the window
+
+    # Proportional to the original 53-frame dataset's 5-frame / 15-frame windows
+    b_len = max(1, round(n_loaded * 5 / 53))
+    c_len = max(2, round(n_loaded * 15 / 53))
+    default_b_start = min(round(n_loaded * 20 / 53), max_frame)
+    default_c_start = min(round(n_loaded * 15 / 53), max_frame)
+
+    dropout_b_start = st.slider("Scenario B — dropout start frame", 0, max_frame, default_b_start)
+    dropout_b_end   = st.slider("Scenario B — dropout end frame", dropout_b_start + 1,
+                                 max_frame + b_len, min(dropout_b_start + b_len, max_frame + b_len))
+    dropout_c_start = st.slider("Scenario C — dropout start frame", 0, max_frame, default_c_start)
+    dropout_c_end   = st.slider("Scenario C — dropout end frame", dropout_c_start + 1,
+                                 max_frame + c_len, min(dropout_c_start + c_len, max_frame + c_len))
+
+    if n_loaded < 15:
+        st.caption(
+            f"ℹ️ Small dataset ({n_loaded} frames) — dropout windows scaled "
+            f"down automatically to fit within the available frames."
+        )
 
     st.divider()
     run_btn = st.button(
