@@ -1,7 +1,9 @@
-streamlit>=1.32.0
-opencv-python-headless>=4.8.0
-numpy>=1.24.0
-pandas>=2.0.0
-plotly>=5.18.0
-pymap3d>=3.0.0
-Pillow>=10.0.0
+streamlit
+opencv-python-headless
+numpy
+pandas
+plotly
+pymap3d
+scipy
+pyyaml
+Pillow
