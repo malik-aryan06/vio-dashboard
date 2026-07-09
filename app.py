@@ -1315,6 +1315,28 @@ if run_btn:
             for msg in fallback_msgs:
                 st.warning(msg)
 
+    # Compute origin + real_north/real_east right after metadata, for BOTH
+    # dataset types, so every later step can rely on these being set --
+    # avoids the fragile pattern of splitting this across two separate
+    # "if is_euroc" branches at different points in the script.
+    n_frames = len(df)
+    if is_euroc:
+        # EuRoC's real_north/real_east were already set in Step 1 above
+        # (from load_euroc_dataset). No real-world georeference exists for
+        # an indoor MAV room, so origin is just (0,0,0) in the room's own
+        # local frame.
+        ORIGIN_LAT = ORIGIN_LON = ORIGIN_ALT = 0.0
+    else:
+        ORIGIN_LAT = float(df['GpsLatitude'].iloc[0])
+        ORIGIN_LON = float(df['GpsLongitude'].iloc[0])
+        ORIGIN_ALT = float(df['AbsoluteAltitude'].iloc[0])
+        real_north, real_east, _ = pymap3d.geodetic2ned(
+            lat=df['GpsLatitude'].values,
+            lon=df['GpsLongitude'].values,
+            h=df['AbsoluteAltitude'].values,
+            lat0=ORIGIN_LAT, lon0=ORIGIN_LON, h0=ORIGIN_ALT
+        )
+
     # ── Step 2: Feature tracking ────────────────────────────
     st.subheader("Step 2 / 4 — Feature tracking")
     prog2      = st.progress(0, text="Initialising ORB...")
@@ -1390,24 +1412,6 @@ if run_btn:
 
     # ── Step 4: VIO estimation ──────────────────────────────
     st.subheader("Step 4 / 4 — Running VIO estimator")
-    if is_euroc:
-        # No real-world georeference exists for an indoor MAV room -- origin
-        # is just (0,0,0) in the room's own local frame. real_north/real_east
-        # were already computed by load_euroc_dataset from ground truth.
-        ORIGIN_LAT = ORIGIN_LON = ORIGIN_ALT = 0.0
-    else:
-        ORIGIN_LAT = float(df['GpsLatitude'].iloc[0])
-        ORIGIN_LON = float(df['GpsLongitude'].iloc[0])
-        ORIGIN_ALT = float(df['AbsoluteAltitude'].iloc[0])
-
-        real_north, real_east, _ = pymap3d.geodetic2ned(
-            lat=df['GpsLatitude'].values,
-            lon=df['GpsLongitude'].values,
-            h=df['AbsoluteAltitude'].values,
-            lat0=ORIGIN_LAT, lon0=ORIGIN_LON, h0=ORIGIN_ALT
-        )
-
-    n_frames = len(df)
 
     if is_euroc:
         # ── Simulated vision dropout (mirrors the DJI GPS-dropout demo) ──
