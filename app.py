@@ -565,6 +565,55 @@ def align_trajectory(N, E, ref_N, ref_E, real_north, real_east):
     n2, e2 = N - oN, E - oE
     return oN + c*n2 - s*e2, oE + s*n2 + c*e2, np.degrees(theta)
 
+def gps_aided_vio(displacements, gps_mask, real_north, real_east):
+    n     = len(gps_mask)
+    eN    = np.zeros(n)
+    eE    = np.zeros(n)
+    eN[0] = real_north[0]
+    eE[0] = real_east[0]
+    ds    = None
+    ALPHA_POWER = 1.7
+    for i in range(1, n):
+        if gps_mask[i]:
+            if ds is not None:
+                dN = real_north[i] - eN[i]
+                dE = real_east[i]  - eE[i]
+                wl = i - ds
+                for j in range(ds + 1, i + 1):
+                    a     = ((j - ds) / wl) ** ALPHA_POWER
+                    eN[j] += a * dN
+                    eE[j] += a * dE
+                ds = None
+            eN[i] = real_north[i]
+            eE[i] = real_east[i]
+        else:
+            if ds is None:
+                ds = i - 1
+            dn, de   = displacements[i - 1]
+            eN[i]    = eN[i - 1] + dn
+            eE[i]    = eE[i - 1] + de
+    return eN, eE
+
+def pure_vio(displacements, real_north, real_east):
+    n     = len(displacements) + 1
+    eN    = np.zeros(n)
+    eE    = np.zeros(n)
+    eN[0] = real_north[0]
+    eE[0] = real_east[0]
+    for i, (dn, de) in enumerate(displacements):
+        eN[i + 1] = eN[i] + dn
+        eE[i + 1] = eE[i] + de
+    return eN, eE
+
+def ned_to_gps(north_arr, east_arr, origin_lat, origin_lon, origin_alt):
+    lats, lons, alts = pymap3d.ned2geodetic(
+        n=north_arr, e=east_arr,
+        d=np.zeros(len(north_arr)),
+        lat0=origin_lat, lon0=origin_lon, h0=origin_alt
+    )
+    return lats, lons, alts
+
+
 def ekf_core(t_imu, accel_meas, gyro_meas, yaw0, dt,
              meas_frame_idx, meas_N, meas_E, meas_R_list,
              p0_n, p0_e):
