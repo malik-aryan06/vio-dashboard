@@ -1828,12 +1828,19 @@ if run_btn:
             st.plotly_chart(fig_inl, use_container_width=True)
 
         # Per-pair tracking table
+        if is_euroc:
+            dn_col = [f"{d:.2f}" for d in dN_list]
+            de_col = [f"{d:.2f}" for d in dE_list]
+        else:
+            dn_col = [f"{d[0]:.2f}" for d in displacements]
+            de_col = [f"{d[1]:.2f}" for d in displacements]
+
         tracking_df = pd.DataFrame({
             "Pair":      [f"{i}→{i+1}" for i in range(n_pairs)],
             "Inliers":   inlier_log,
             "Source":    sources,
-            "dn (m)":    [f"{d[0]:.2f}" for d in displacements],
-            "de (m)":    [f"{d[1]:.2f}" for d in displacements],
+            "dn (m)":    dn_col,
+            "de (m)":    de_col,
         })
         st.dataframe(tracking_df, use_container_width=True, hide_index=True, height=300)
 
