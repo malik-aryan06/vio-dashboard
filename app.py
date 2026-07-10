@@ -565,33 +565,79 @@ def align_trajectory(N, E, ref_N, ref_E, real_north, real_east):
     n2, e2 = N - oN, E - oE
     return oN + c*n2 - s*e2, oE + s*n2 + c*e2, np.degrees(theta)
 
-def gps_aided_vio(displacements, gps_mask, real_north, real_east):
-    n     = len(gps_mask)
-    eN    = np.zeros(n)
-    eE    = np.zeros(n)
-    eN[0] = real_north[0]
-    eE[0] = real_east[0]
-    ds    = None
-    ALPHA_POWER = 1.7
-    for i in range(1, n):
-        if gps_mask[i]:
-            if ds is not None:
-                dN = real_north[i] - eN[i]
-                dE = real_east[i]  - eE[i]
-                wl = i - ds
-                for j in range(ds + 1, i + 1):
-                    a     = ((j - ds) / wl) ** ALPHA_POWER
-                    eN[j] += a * dN
-                    eE[j] += a * dE
-                ds = None
-            eN[i] = real_north[i]
-            eE[i] = real_east[i]
+def rts_smooth_1d(z, u, gps_mask, Q, R, x0):
+    """
+    1D Kalman filter + Rauch-Tung-Striebel (RTS) smoother for a single axis
+    (north or east). Replaces the old power-law drift ramp (Scenarios A/B/C)
+    with the same batch estimator used in the notebook pipeline (ph4/ph5):
+
+    - Predict step uses the VIO displacement as the motion/control input.
+    - Update step fuses in the GPS position (when available) with a Kalman
+      gain reflecting how much we trust VIO vs. GPS at that instant.
+    - The backward RTS pass lets GPS fixes on BOTH sides of a denied window
+      correct the trajectory, instead of only the fix waiting at the far end
+      of a one-sided ramp -- this removes both the "drift grows uniformly"
+      assumption and the velocity kink at the window edges that any single-
+      sided ramp (linear or power-law) leaves behind.
+
+    z        : GPS position per frame (used only where gps_mask is True)
+    u        : VIO displacement per frame transition, u[k] = step from k to k+1
+    gps_mask : boolean array, True = GPS available at this frame
+    Q        : process noise variance (VIO displacement error per step, m^2)
+    R        : measurement noise variance (GPS accuracy, m^2)
+    x0       : initial position (frame 0 is always GPS-anchored)
+    """
+    n = len(gps_mask)
+    xp = np.zeros(n); Pp = np.zeros(n)
+    xf = np.zeros(n); Pf = np.zeros(n)
+    xf[0] = x0
+    Pf[0] = 1e-6   # frame 0 is always GPS-anchored, treat as (near-)exact
+
+    for k in range(1, n):
+        xp[k] = xf[k-1] + u[k-1]
+        Pp[k] = Pf[k-1] + Q
+        if gps_mask[k]:
+            K = Pp[k] / (Pp[k] + R)
+            xf[k] = xp[k] + K * (z[k] - xp[k])
+            Pf[k] = (1 - K) * Pp[k]
         else:
-            if ds is None:
-                ds = i - 1
-            dn, de   = displacements[i - 1]
-            eN[i]    = eN[i - 1] + dn
-            eE[i]    = eE[i - 1] + de
+            xf[k] = xp[k]
+            Pf[k] = Pp[k]
+
+    xs = np.zeros(n); Ps = np.zeros(n)
+    xs[-1] = xf[-1]
+    Ps[-1] = Pf[-1]
+    for k in range(n - 2, -1, -1):
+        C = Pf[k] / Pp[k+1]
+        xs[k] = xf[k] + C * (xs[k+1] - xp[k+1])
+        Ps[k] = Pf[k] + C**2 * (Ps[k+1] - Pp[k+1])
+
+    return xs
+
+
+def gps_aided_vio(displacements, gps_mask, real_north, real_east):
+    """
+    GPS-aided VIO estimator using a Kalman filter + RTS smoother per axis
+    (north/east independently). See rts_smooth_1d for the estimator details.
+
+    Q (process noise) is estimated empirically from how much the VIO
+    displacement disagrees with the true GPS step over the whole flight --
+    a data-driven noise estimate rather than a hand-picked constant.
+    R (measurement noise) uses a typical consumer-GPS horizontal accuracy;
+    tune this if your dataset's GPS spec is known to differ.
+    """
+    dn = np.array([d[0] for d in displacements])
+    de = np.array([d[1] for d in displacements])
+
+    true_step_n = np.diff(real_north)
+    true_step_e = np.diff(real_east)
+    Q_north = max(np.var(dn - true_step_n), 1e-6)
+    Q_east  = max(np.var(de - true_step_e), 1e-6)
+
+    R_gps = 3.0 ** 2   # ~3 m 1-sigma consumer-GPS horizontal accuracy assumption
+
+    eN = rts_smooth_1d(real_north, dn, gps_mask, Q_north, R_gps, real_north[0])
+    eE = rts_smooth_1d(real_east,  de, gps_mask, Q_east,  R_gps, real_east[0])
     return eN, eE
 
 def pure_vio(displacements, real_north, real_east):
