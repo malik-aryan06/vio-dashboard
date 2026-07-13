@@ -279,20 +279,11 @@ def build_displacements(tracking_results, df, manual_altitude_m=0.0, manual_yaw_
     per-pair, which altitude/yaw source was actually used, so the UI can warn
     the user when estimates rather than real telemetry drove the numbers
     (instead of silently reusing DJI-only values on other datasets).
-
-    When neither vision tracking NOR IMU-speed telemetry is available for a
-    pair, we carry forward the last known-good displacement rather than
-    assuming zero motion -- a drone in constant flight almost never actually
-    stops, so "keep going the way we were going" is a better default than
-    zero. This also avoids injecting a large, spurious residual into the
-    empirical process-noise (Q) estimate used downstream, which could
-    otherwise inflate Q for the entire flight from a single bad frame.
     """
     displacements  = []
     sources        = []
     fallback_notes = []
     has_imu_speed  = 'FlightXSpeed' in df.columns and 'FlightYSpeed' in df.columns
-    last_good      = (0.0, 0.0)
 
     for i, r in enumerate(tracking_results):
         row = df.iloc[i]
@@ -303,21 +294,20 @@ def build_displacements(tracking_results, df, manual_altitude_m=0.0, manual_yaw_
             imu_de = float(row['FlightYSpeed']) * dt
         else:
             # No IMU/flight-speed telemetry in this dataset -- can't estimate
-            # motion for frames where vision tracking also failed. Carry
-            # forward the last known-good displacement rather than assuming
-            # zero motion; this is flagged to the user either way.
-            imu_dn, imu_de = last_good
+            # motion for frames where vision tracking also failed. Assume
+            # zero motion rather than crashing; this is flagged to the user.
+            imu_dn = imu_de = 0.0
 
         if r is None:
             dn, de  = imu_dn, imu_de
             src_tag = 'imu_only'
-            fallback_notes.append('no_telemetry_carry_forward' if not has_imu_speed else 'ok')
+            fallback_notes.append('no_telemetry_zero_motion' if not has_imu_speed else 'ok')
         else:
             altitude_m, alt_src = resolve_altitude_m(row, manual_altitude_m)
             if altitude_m is None:
                 # No altitude available from any source -- vision displacement
-                # can't be scaled to meters. Fall back to IMU (or carry-forward)
-                # for this pair rather than raising an exception.
+                # can't be scaled to meters. Fall back to IMU (or zero) for
+                # this pair rather than raising an exception.
                 dn, de  = imu_dn, imu_de
                 src_tag = 'imu_only'
                 fallback_notes.append('no_altitude_available')
@@ -346,7 +336,6 @@ def build_displacements(tracking_results, df, manual_altitude_m=0.0, manual_yaw_
                     src_tag = 'blended'
         displacements.append((dn, de))
         sources.append(src_tag)
-        last_good = (dn, de)
     return displacements, sources, fallback_notes
 
 
@@ -626,18 +615,6 @@ def rts_smooth_1d(z, u, gps_mask, Q, R, x0):
     return xs
 
 
-def robust_variance(residuals):
-    """
-    Median Absolute Deviation (MAD) based variance estimate, used instead of
-    plain np.var() for the empirical process noise Q. A single bad frame
-    (failed tracking pair, GPS glitch) can blow up a plain variance estimate
-    for the WHOLE flight; MAD is far less sensitive to one or two outliers.
-    """
-    med = np.median(residuals)
-    mad = np.median(np.abs(residuals - med))
-    robust_std = 1.4826 * mad   # makes MAD consistent with std under normality
-    return max(robust_std ** 2, 1e-6)
-
 def gps_aided_vio(displacements, gps_mask, real_north, real_east):
     """
     GPS-aided VIO estimator using a Kalman filter + RTS smoother per axis
@@ -645,9 +622,7 @@ def gps_aided_vio(displacements, gps_mask, real_north, real_east):
 
     Q (process noise) is estimated empirically from how much the VIO
     displacement disagrees with the true GPS step over the whole flight --
-    a data-driven noise estimate rather than a hand-picked constant. Uses a
-    robust (MAD-based) estimator so a single outlier frame (failed tracking
-    pair, GPS glitch) can't inflate Q for the entire flight.
+    a data-driven noise estimate rather than a hand-picked constant.
     R (measurement noise) uses a typical consumer-GPS horizontal accuracy;
     tune this if your dataset's GPS spec is known to differ.
     """
@@ -656,8 +631,8 @@ def gps_aided_vio(displacements, gps_mask, real_north, real_east):
 
     true_step_n = np.diff(real_north)
     true_step_e = np.diff(real_east)
-    Q_north = robust_variance(dn - true_step_n)
-    Q_east  = robust_variance(de - true_step_e)
+    Q_north = max(np.var(dn - true_step_n), 1e-6)
+    Q_east  = max(np.var(de - true_step_e), 1e-6)
 
     R_gps = 3.0 ** 2   # ~3 m 1-sigma consumer-GPS horizontal accuracy assumption
 
@@ -1426,12 +1401,10 @@ if run_btn:
         if df['RelativeAltitude'].isna().any():
             fallback_msgs.append("❗ Some frames have no altitude from any source (no DJI telemetry, "
                                   "no EXIF GPS altitude, no manual override) — those frame pairs will "
-                                  "fall back to IMU speed or a carried-forward prior displacement instead "
-                                  "of vision-based displacement.")
+                                  "fall back to IMU/zero motion instead of vision-based displacement.")
         if 'FlightXSpeed' not in df.columns:
             fallback_msgs.append("🚀 No IMU flight-speed telemetry found — frames where vision "
-                                  "tracking fails will carry forward the last known-good displacement "
-                                  "instead of an IMU estimate.")
+                                  "tracking fails will assume zero motion instead of an IMU estimate.")
     if fallback_msgs:
         with st.expander("⚠️ This dataset is missing some DJI-specific metadata — click for details", expanded=True):
             for msg in fallback_msgs:
@@ -1528,9 +1501,8 @@ if run_btn:
     if n_estimated_pairs:
         st.caption(
             f"ℹ️ {n_estimated_pairs}/{n_pairs if is_euroc else len(disp_fallback_notes)} frame pairs "
-            f"had unreliable tracking and fell back to IMU speed, a carried-forward prior "
-            f"displacement, or an estimated non-DJI altitude/heading value for that pair "
-            f"{'(see fallback details above)' if not is_euroc else ''}."
+            f"had unreliable tracking and fell back to zero motion for that pair "
+            f"{'(or used an estimated non-DJI altitude/heading value)' if not is_euroc else ''}."
         )
 
     # ── Step 4: VIO estimation ──────────────────────────────
