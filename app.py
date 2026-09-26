@@ -1669,7 +1669,7 @@ if run_btn:
             )
 
         for name, lats, lons, color, sym, sz in trajectories_map:
-            fig_map.add_trace(go.Scattermapbox(
+            fig_map.add_trace(go.Scattermap(
                 lat=lats, lon=lons,
                 mode="lines+markers",
                 marker=dict(size=sz, color=color, symbol=sym),
@@ -1679,7 +1679,7 @@ if run_btn:
             ))
 
         fig_map.update_layout(
-            mapbox=dict(
+            map=dict(
                 style="open-street-map",
                 center=dict(lat=float(np.mean(lats_real)), lon=float(np.mean(lons_real))),
                 zoom=14
